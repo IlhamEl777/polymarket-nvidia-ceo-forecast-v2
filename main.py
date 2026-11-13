@@ -7,31 +7,33 @@ writes <case>.out to $MAKEFUN_OUTPUT_DIR (else /output): for each market,
 240 rows of five quantiles (0.05, 0.25, 0.5, 0.75, 0.95) of the Yes price
 at each minute after the checkpoint.
 
-Method: a 60/40 blend of two empirical forecasters that share one idea —
-these prices sit still for long stretches, move in ticks, and jump rarely,
-so the quantiles of the price h minutes ahead are read off the market's
-own recent h-minute changes, not a Gaussian spread.
+Idea: these prices sit still for long stretches, move in ticks, and jump
+rarely, so the quantiles of the price h minutes ahead are read off the
+market's own recent h-minute changes, not a Gaussian spread. The forecast
+is a 60/40 blend of two empirical forecasters built on that idea:
 
 A (weight 0.6): per-market quantile-offset curves. For a grid of horizons,
-the market's overlapping h-minute changes over the last WINDOW minutes
-give empirical quantile offsets, blended by sample count with the offsets
-pooled over all the case's markets (short or quiet markets lean on the
-pool), interpolated over h in sqrt-space, with the inner offsets scaled by
-INNER_W and the outer by OUTER_W and the median carrying a shrunk share
-of the empirical median offset.
+the market's overlapping h-minute changes over the last HISTORY_MIN
+minutes give empirical quantile offsets, blended by sample count with the
+offsets pooled over all the case's markets (short or quiet markets lean on
+the pool), interpolated over h in sqrt-space, with the inner offsets scaled
+by INNER_SCALE and the outer by OUTER_SCALE and the median carrying a
+shrunk share of the empirical median offset. A market with fewer than
+MIN_COUNT samples at a horizon falls back to the pooled curve outright.
 
 C (weight 0.4): pooled offsets at h = 240 only, grown back over the
 horizon like sqrt(h), with each market's offsets rescaled by its recent
-activity — its mean absolute 1-minute change over the last ACT_WIN
-minutes relative to the pool's — clamped to [R_LO, R_HI] and scaled by
-MULT. Where A trusts each market's whole curve, C trusts only its level
-of activity; averaging the two is steadier than either alone.
+activity — its mean absolute 1-minute change over the last ACTIVITY_MIN
+minutes relative to the pool's — clamped to [RATIO_MIN, RATIO_MAX] and
+scaled by POOL_SCALE. Where A trusts each market's whole curve, C trusts
+only its level of activity; averaging the two is steadier than either
+alone.
 
-v2 changes vs the pre-open build: the inner-quantile scale INNER_W was
-raised 0.45 -> 0.50 (the 25%/75% bands were slightly too tight on the
-practice cases), and markets with too little history now fall back to the
-pooled curve explicitly instead of relying on the shrink weight alone.
-Deterministic, stdlib only, no network.
+v2 changes vs the pre-open build: the inner-quantile scale 0.45 -> 0.50
+(the 25%/75% bands were slightly too tight on the practice cases), an
+explicit pooled-curve fallback for markets with too little history, and a
+shared weighted-pool helper used by both components. Deterministic, stdlib
+only, no network.
 
 On the kit's practice cases p00..p04 (scored against the next case's
 history) this scores a mean pinball loss of about 0.31 against the house
@@ -43,18 +45,18 @@ import math
 import os
 
 TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
-GRID = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 240)
-WINDOW = 2880        # minutes of history used to estimate changes
-SHRINK = 800.0       # samples at which a market's own curve is half trusted
-MEDIAN_DRIFT = 0.25  # share of the empirical median offset kept
-INNER_W = 0.50       # scale for the 0.25 / 0.75 offsets (component A)
-OUTER_W = 0.35       # scale for the 0.05 / 0.95 offsets (component A)
-ACT_WIN = 360        # minutes for the activity ratio (component C)
-MULT = 0.8           # overall scale of the pooled offsets (component C)
-GAMMA = 0.5          # horizon growth exponent (component C)
-R_LO, R_HI = 0.3, 3.0
-W_A = 0.6            # blend weight of component A
-MIN_SAMPLES = 8      # below this, a market's own curve is not trusted
+HORIZONS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 240)
+HISTORY_MIN = 2880      # minutes of history used to estimate changes
+SHRINK_SAMPLES = 800.0  # samples at which a market's own curve is half trusted
+MEDIAN_KEEP = 0.25      # share of the empirical median offset kept
+INNER_SCALE = 0.50      # scale for the 0.25 / 0.75 offsets (component A)
+OUTER_SCALE = 0.35      # scale for the 0.05 / 0.95 offsets (component A)
+ACTIVITY_MIN = 360      # minutes for the activity ratio (component C)
+POOL_SCALE = 0.8        # overall scale of the pooled offsets (component C)
+GROWTH_EXP = 0.5        # horizon growth exponent (component C)
+RATIO_MIN, RATIO_MAX = 0.3, 3.0
+WEIGHT_A = 0.6          # blend weight of component A
+MIN_COUNT = 8           # below this, a market's own curve is not trusted
 
 
 def _quantile(sorted_vals, tau):
@@ -75,10 +77,25 @@ def _change_quantiles(prices, h):
     n = len(prices)
     if n <= h:
         return None, 0
+    # Stride h//2 keeps long-horizon samples overlapping but not
+    # degenerate: at h=240 over 2880 minutes that is still ~24 samples.
     stride = max(1, h // 2)
     diffs = [prices[i + h] - prices[i] for i in range(0, n - h, stride)]
     diffs.sort()
     return [_quantile(diffs, t) for t in TAUS], len(diffs)
+
+
+def _weighted_pool(entries):
+    """Sample-count-weighted mean of per-market quantile offsets.
+
+    entries: list of (quantiles, sample_count). Returns the pooled
+    quantiles, or all zeros when there is nothing to pool.
+    """
+    if not entries:
+        return [0.0] * len(TAUS)
+    total = sum(c for _, c in entries)
+    return [sum(qs[j] * c for qs, c in entries) / total
+            for j in range(len(TAUS))]
 
 
 def _finish(vals):
@@ -94,59 +111,51 @@ def _finish(vals):
 
 
 def _interp(curve, h):
-    if h <= GRID[0]:
-        return curve[GRID[0]]
-    if h >= GRID[-1]:
-        return curve[GRID[-1]]
-    for a, b in zip(GRID, GRID[1:]):
+    if h <= HORIZONS[0]:
+        return curve[HORIZONS[0]]
+    if h >= HORIZONS[-1]:
+        return curve[HORIZONS[-1]]
+    for a, b in zip(HORIZONS, HORIZONS[1:]):
         if a <= h <= b:
             f = (math.sqrt(h) - math.sqrt(a)) / (math.sqrt(b) - math.sqrt(a))
             return [curve[a][j] * (1.0 - f) + curve[b][j] * f
                     for j in range(len(TAUS))]
-    return curve[GRID[-1]]
+    return curve[HORIZONS[-1]]
 
 
 def _component_a(case, horizon):
     """Per-market empirical offset curves, blended with the pool."""
     markets = case["markets"]
     own = []
-    pooled = {h: [] for h in GRID}
+    pooled = {h: [] for h in HORIZONS}
     for m in markets:
-        prices = m["prices"][-WINDOW:]
+        prices = m["prices"][-HISTORY_MIN:]
         per_h = {}
-        for h in GRID:
+        for h in HORIZONS:
             qs, cnt = _change_quantiles(prices, h)
             per_h[h] = (qs, cnt)
             if qs is not None:
                 pooled[h].append((qs, cnt))
         own.append(per_h)
-    pool_q = {}
-    for h in GRID:
-        lst = pooled[h]
-        if not lst:
-            pool_q[h] = [0.0] * len(TAUS)
-            continue
-        tot = sum(c for _, c in lst)
-        pool_q[h] = [sum(qs[j] * c for qs, c in lst) / tot
-                     for j in range(len(TAUS))]
-    scales = (OUTER_W, INNER_W, 0.0, INNER_W, OUTER_W)
+    pool_q = {h: _weighted_pool(pooled[h]) for h in HORIZONS}
+    scales = (OUTER_SCALE, INNER_SCALE, 0.0, INNER_SCALE, OUTER_SCALE)
     out = {}
     for m, per_h in zip(markets, own):
         curve = {}
-        for h in GRID:
+        for h in HORIZONS:
             qs, cnt = per_h[h]
-            if qs is None or cnt < MIN_SAMPLES:
+            if qs is None or cnt < MIN_COUNT:
                 # Too little history: trust the pooled curve outright.
                 curve[h] = pool_q[h]
             else:
-                w = cnt / (cnt + SHRINK)
+                w = cnt / (cnt + SHRINK_SAMPLES)
                 curve[h] = [w * qs[j] + (1.0 - w) * pool_q[h][j]
                             for j in range(len(TAUS))]
         x = m["prices"][-1]
         rows = []
         for h in range(1, horizon + 1):
             offs = _interp(curve, h)
-            med = x + MEDIAN_DRIFT * offs[2]
+            med = x + MEDIAN_KEEP * offs[2]
             vals = [med if j == 2 else
                     med + scales[j] * (offs[j] - offs[2])
                     for j in range(len(TAUS))]
@@ -160,18 +169,13 @@ def _component_c(case, horizon):
     markets = case["markets"]
     pooled = []
     for m in markets:
-        qs, cnt = _change_quantiles(m["prices"][-WINDOW:], horizon)
+        qs, cnt = _change_quantiles(m["prices"][-HISTORY_MIN:], horizon)
         if qs is not None:
             pooled.append((qs, cnt))
-    if pooled:
-        tot = sum(c for _, c in pooled)
-        pool = [sum(q[j] * c for q, c in pooled) / tot
-                for j in range(len(TAUS))]
-    else:
-        pool = [0.0] * len(TAUS)
+    pool = _weighted_pool(pooled)
     acts = []
     for m in markets:
-        p = m["prices"][-ACT_WIN:]
+        p = m["prices"][-ACTIVITY_MIN:]
         d = [abs(p[i + 1] - p[i]) for i in range(len(p) - 1)]
         acts.append(sum(d) / max(len(d), 1))
     a_pool = sum(acts) / len(acts) if acts else 0.0
@@ -179,11 +183,11 @@ def _component_c(case, horizon):
     for m, a in zip(markets, acts):
         x = m["prices"][-1]
         r = (a / a_pool) if a_pool > 0 else 1.0
-        r = min(R_HI, max(R_LO, r))
+        r = min(RATIO_MAX, max(RATIO_MIN, r))
         rows = []
         for h in range(1, horizon + 1):
-            g = (h / horizon) ** GAMMA * MULT * r
-            med = x + MEDIAN_DRIFT * pool[2] * g
+            g = (h / horizon) ** GROWTH_EXP * POOL_SCALE * r
+            med = x + MEDIAN_KEEP * pool[2] * g
             vals = [med if j == 2 else med + (pool[j] - pool[2]) * g
                     for j in range(len(TAUS))]
             rows.append(_finish(vals))
@@ -198,7 +202,7 @@ def forecast_case(case):
     out = {}
     for m in case["markets"]:
         mid = m["id"]
-        out[mid] = [_finish([W_A * va + (1.0 - W_A) * vc
+        out[mid] = [_finish([WEIGHT_A * va + (1.0 - WEIGHT_A) * vc
                              for va, vc in zip(ra, rc)])
                     for ra, rc in zip(a[mid], c[mid])]
     return out
